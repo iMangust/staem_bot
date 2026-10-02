@@ -1,11 +1,1 @@
-__pycache__/
-*.log
-.env
-steam_bot.db
-
-# Личные данные аккаунта Steam — никогда не коммитить!
-steam_cookies.json
-bot_settings.json
-owned_games_cache.json
-*.bak
-steam_bot.py
+(empty)

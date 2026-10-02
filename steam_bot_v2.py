@@ -75,6 +75,7 @@ _cfg = _init_config()
 
 STEAM_CONFIG = {
     'api_store': 'https://store.steampowered.com',
+    'checkout': 'https://checkout.steampowered.com',
     'timeout': 25,
     'delay': 1.0,          # пауза между запросами к Steam
     'max_retries': 3,      # ретраи сетевых ошибок
@@ -150,6 +151,10 @@ class GameInfo:
     type_name: str = ""
     is_free: bool = False
     details_loaded: bool = False
+    # DLC-специфика (appdetails 'dlc' + fullgame)
+    is_dlc: bool = False
+    parent_app_id: Optional[str] = None
+    parent_game_name: Optional[str] = None
 
     def __post_init__(self):
         if self.genres is None:
@@ -298,6 +303,10 @@ class SteamSession:
 
     LOGIN_MARKERS = ('login?redir', 'accounts.login', 'sign in', 'войти')
 
+    # кэш загруженных GameInfo по appid (классовый: им пользуются и сессия,
+    # и хендлеры бота) — детали грузятся один раз на игру за аптайм
+    _details_cache: Dict[str, 'GameInfo'] = {}
+
     def __init__(self, cookies_file: Path = COOKIES_FILE,
                  settings: Optional['SettingsManager'] = None,
                  health: Optional[HealthMonitor] = None):
@@ -315,6 +324,9 @@ class SteamSession:
         self._session: Optional[aiohttp.ClientSession] = None
         self._auth_lock = asyncio.Lock()
         self._reloading_cookies = False
+        # кэш GameInfo родительских игр для DLC (фильтр «DLC только если
+        # базовая игра в библиотеке»)
+        self._parent_cache: Dict[str, GameInfo] = {}
 
     # ---------- cookies ----------
     @staticmethod
@@ -621,14 +633,28 @@ class SteamSession:
         return False
 
     async def is_game_owned(self, app_id: str, force_refresh: bool = False) -> bool:
+        """Проверка наличия в библиотеке. ФИКС (DLC): страница DLC помечается
+        Steam как 'owned', если у аккаунта есть базовая игра, — поэтому для
+        DLC ответ берётся строго по кэшу лицензий (appids из
+        ajaxrenderownedgames / account licenses), без HTML-false-positive."""
         app_id = str(app_id)
         await self.refresh_owned_games_cache(force=force_refresh)
         if app_id in self._owned_games_cache:
             return True
+        if self._is_dlc_appid(app_id):
+            logger.info(f"🧩 {app_id} — DLC: в лицензии-кэше отсутствует → "
+                        f"считаем не добавленным (без false-positive по странице)")
+            return False
         owned = await self._check_game_page_owned(app_id)
         if owned:
             self.mark_game_owned(app_id)
         return owned
+
+    def _is_dlc_appid(self, app_id: str) -> bool:
+        """DLC ли этот appid? Быстрый ответ — из кэша загруженных деталей;
+        если детали ещё не грузились — неизвестно (False → обычная проверка)."""
+        g = SteamSession._details_cache.get(str(app_id))
+        return bool(g is not None and g.is_dlc)
 
     def mark_game_owned(self, app_id: str):
         """Инкрементально добавляет игру в кэш (ФИКС: после успешного
@@ -708,13 +734,60 @@ class SteamSession:
                   'software': 'Программа'}.get(d.get('type'), d.get('type') or '')
             game.type_name = tp
             game.is_free = bool(d.get('is_free'))
+            # --- DLC: определяем родительскую игру (для фильтра «только если
+            # базовая игра в библиотеке» и понятной карточки) ---
+            game.is_dlc = (d.get('type') == 'dlc')
             fullgame = d.get('fullgame') or {}
-            if fullgame.get('appid') and not game.original_price:
-                game.name = game.name or d.get('name', '')
+            if fullgame.get('appid'):
+                game.parent_app_id = str(fullgame['appid'])
+                fg_name = (fullgame.get('name') or '').strip()
+                m = re.match(r'^\s*(.+?)\s*[:\-–—]\s*\S.*$', fg_name, flags=re.S)
+                game.parent_game_name = (m.group(1) if m else fg_name) or None
             game.details_loaded = True
+            # кладём в общий кэш — чтобы тип (game/dlc) был известен и до
+            # отправки карточки (фильтр DLC, проверка библиотеки)
+            SteamSession._details_cache[str(game.app_id)] = game
         except Exception as e:
             logger.warning(f"⚠️ Не удалось получить детали {game.app_id}: {e}")
         return game
+
+    async def resolve_parent_game(self, game: GameInfo) -> Optional[GameInfo]:
+        """Для DLC возвращает GameInfo родительской игры (appdetails fullgame)."""
+        if not game.is_dlc or not game.parent_app_id:
+            return None
+        cached = self._parent_cache.get(game.parent_app_id)
+        if cached is not None:
+            return cached
+        parent = GameInfo(app_id=game.parent_app_id,
+                          name=game.parent_game_name or game.parent_app_id,
+                          url=f'{STEAM_CONFIG["api_store"]}/app/{game.parent_app_id}/')
+        await self.get_game_details(parent)
+        if not parent.name or parent.name == parent.app_id:
+            parent.name = game.parent_game_name or parent.app_id
+        self._parent_cache[parent.app_id] = parent
+        return parent
+
+    @staticmethod
+    def _extract_dlc_parent(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str]]:
+        """Fallback без appdetails: ищем ссылку на базовую игру в хлебных
+        крошках страницы DLC (/dlc/<id>/<base-slug>/). Возвращает (app_id, имя)."""
+        try:
+            for a in soup.select('.breadcrumbs a'):
+                href = a.get('href') or ''
+                m = re.search(r'/app/(\d+)/', href)
+                if m:
+                    return m.group(1), a.get_text(strip=True) or None
+            # заголовок вида «Bazooka Boy: Super Bazooka Gun DLC» → базовое имя
+            h1 = soup.select_one('#appHubAppName')
+            title = (h1.get_text(strip=True) if h1 else
+                     (soup.title.get_text(strip=True) if soup.title else ''))
+            if 'DLC' in title.upper():
+                m = re.match(r'^\s*(.+?)\s*[:\-–—]\s*\S.*$', title, flags=re.S)
+                if m:
+                    return None, m.group(1).strip() or None
+        except Exception:
+            pass
+        return None, None
 
     @staticmethod
     def _esc(s: str) -> str:
@@ -738,6 +811,8 @@ class SteamSession:
         meta = []
         if game.type_name:
             meta.append(game.type_name)
+        if game.is_dlc and game.parent_game_name:
+            meta.append(f"для «{game.parent_game_name}»")
         meta.extend(game.genres[:4])
         if game.release_date:
             meta.append(f"выход: {game.release_date}")
@@ -807,29 +882,66 @@ class SteamSession:
         if not self.session_id:
             return False, "❌ Нет sessionid в cookies"
 
+        # ФИКС v2.3: ajaxaddfreebgame/addfreelicense на store.steampowered.com
+        # не существуют как POST-эндпоинты — Steam отдавал HTML главной
+        # страницы ("Неожиданный ответ Steam ... <!DOCTYPE html>"). Реальный
+        # эндпоинт кнопки «Add to your library» — checkout
+        # /shoppingcart/addfreetrial/ (JSON). Порядок попыток:
+        #   1) GET страницы игры — валидация сессии + свежий snr
+        #   2) checkout /shoppingcart/addfreetrial/ (key=subid, JSON)
+        #   3) legacy fallbacks (ajaxaddfreebgame → addfreelicense)
+        #   4) идемпотентный store /api/addfreetrial/ — верификация и
+        #      повторная попытка (SUCCESS / ALREADY_IN_LIBRARY / ERROR_*)
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Origin': STEAM_CONFIG['api_store'],
+            'Accept': 'application/json, text/plain, */*',
+            'Origin': STEAM_CONFIG['checkout'],
             'Referer': f'{STEAM_CONFIG["api_store"]}/app/{app_id}/',
             'X-Requested-With': 'XMLHttpRequest',
         }
         logger.info(f"🎮 Попытка добавить {app_id} (subid={subid})")
 
-        # 1) основной путь: /ajaxaddfreebgame/ (работает и для DLC)
-        data = {
-            'sessionid': self.session_id,
-            'key': subid,
-            'method': 'web',
-            'country_code': 'RU',
-        }
-        status, text, j = await self._request(
-            'POST', f'{STEAM_CONFIG["api_store"]}/ajaxaddfreebgame/',
-            data=data, headers=headers, expect_json=True)
-        added_now, already, err = self._parse_add_response(status, text, j)
+        # 0) страница игры: ранний детект мёртвой сессии + snr для legacy-пути
+        page_status, page_text, _ = await self._request(
+            'GET', f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')
+        if page_status in (301, 302) or (page_text and self._looks_like_login(
+                f'{STEAM_CONFIG["api_store"]}/app/{app_id}/', page_text)):
+            return False, self._ADD_ERRORS['auth']
+        if not snr and page_text:
+            m = re.search(r"snr[=:]\s*['\"]?([\w.#]+)", page_text)
+            if m:
+                snr = m.group(1)
 
-        # 2) запасной путь: /freelicense/addfreelicense/ (special kinds)
-        if not (added_now or already):
-            data2 = {
+        attempts = []
+        # 1) основной путь: checkout /shoppingcart/addfreetrial/
+        attempts.append((
+            f'{STEAM_CONFIG["checkout"]}/shoppingcart/addfreetrial/',
+            {
+                'sessionid': self.session_id,
+                'key': subid,
+                'appid': app_id,
+                'method': 'web',
+                'country_code': 'RU',
+            },
+            None,
+        ))
+        # 2) legacy-путь ajaxaddfreebgame (без валидного snr Steam отвечает
+        #    success:false, а не HTML)
+        attempts.append((
+            f'{STEAM_CONFIG["api_store"]}/ajaxaddfreebgame/',
+            {
+                'sessionid': self.session_id,
+                'key': subid,
+                'method': 'web',
+                'country_code': 'RU',
+                'snr': snr or 'search.results;direct_browse',
+            },
+            {'Origin': STEAM_CONFIG['api_store']},
+        ))
+        # 3) запасной путь: /freelicense/addfreelicense/ (special kinds)
+        attempts.append((
+            f'{STEAM_CONFIG["api_store"]}/freelicense/addfreelicense/',
+            {
                 'action': 'add_to_cart',
                 'sessionid': self.session_id,
                 'packageid': '',
@@ -838,19 +950,49 @@ class SteamSession:
                 'originating_snr': originating_snr or '1_direct-navigation__',
                 'wants_gift': '0',
                 'duplicate_allowed': '0',
-            }
-            status2, text2, j2 = await self._request(
-                'POST', f'{STEAM_CONFIG["api_store"]}/freelicense/addfreelicense/',
-                data=data2, headers=headers, expect_json=True)
-            a2, k2, e2 = self._parse_add_response(status2, text2, j2)
-            added_now, already = added_now or a2, already or k2
-            if not (added_now or already):
-                err = e2 or err
-                if isinstance(e2, tuple):
-                    return False, self._ADD_ERRORS.get(e2, "⚠️ Steam не подтвердил добавление")
+            },
+            {'Origin': STEAM_CONFIG['api_store']},
+        ))
+
+        added_now = already = False
+        err: object = None
+        last_text = ''
+        for url_ep, data, hdr_over in attempts:
+            h = dict(headers)
+            if hdr_over:
+                h.update(hdr_over)
+            status, text, j = await self._request(
+                'POST', url_ep, data=data, headers=h, expect_json=True)
+            last_text = text or last_text
+            a, k, e = self._parse_add_response(status, text, j)
+            if a or k:
+                added_now, already = added_now or a, already or k
+                err = None
+                break
+            # auth/network — смысла крутить следующие эндпоинты нет
+            if e in ('auth', 'network'):
+                err = e
+                break
+            # JSON с понятным error_code (кромеAlready/Success) — ответ реальный,
+            # idём дальше только если это просто HTML/непонятный ответ
+            if isinstance(e, tuple):
+                ec = str(e[1] or '')
+                if ec and ec not in ('', 'None'):
+                    err = e
+                    break
+            if err is None or e not in (None, 'html'):
+                err = e
 
         if isinstance(err, tuple):
             return False, self._ADD_ERRORS.get(err, "⚠️ Steam не подтвердил добавление")
+        if err == 'auth':
+            return False, self._ADD_ERRORS['auth']
+        if err == 'network':
+            return False, self._ADD_ERRORS['network']
+        if err == 'rate':
+            return False, self._ADD_ERRORS['rate']
+        if err == 'cart':
+            return False, self._ADD_ERRORS['cart']
 
         if added_now or already:
             verified = await self._verify_free_license(app_id, subid)
@@ -859,6 +1001,10 @@ class SteamSession:
                 msg = ("✅ Игра добавлена в библиотеку!" if verified == 'SUCCESS'
                        else "✅ Уже в библиотеке!")
                 return True, msg
+            if verified == 'FREE_LICENSE_DISABLED':
+                return False, "🚫 Раздача этой игры уже завершена (Free License Disabled)"
+            if verified == 'ERROR_RATE_LIMIT_EXCEEDED':
+                return False, self._ADD_ERRORS['rate']
             # текст обещал успех, но addfreetrial не подтвердил — доверяем
             # первичному ответу (для DLC addfreetrial может быть недоступен)
             logger.info(f"ℹ️ {app_id}: верификация через addfreetrial не подтвердила "
@@ -867,9 +1013,67 @@ class SteamSession:
             return True, ("✅ Добавлено в библиотеку!" if added_now
                           else "✅ Уже в библиотеке!")
 
-        logger.warning(f"❌ Неожиданный ответ Steam на добавление {app_id}: "
-                       f"{(text or '')[:200]}")
-        return False, "⚠️ Steam не подтвердил добавление"
+        # НИ ОДИН эндпоинт не дал успеха. Фолбэк: честная проверка через
+        # идемпотентный /api/addfreetrial/ (он и добавляет, и возвращает
+        # понятные коды: SUCCESS / ALREADY_IN_LIBRARY / ERROR_*).
+        verified = await self._verify_free_license(app_id, subid)
+        if verified == 'SUCCESS':
+            self.mark_game_owned(app_id)
+            return True, "✅ Игра добавлена в библиотеку! (через addfreetrial)"
+        if verified == 'ALREADY_IN_LIBRARY':
+            self.mark_game_owned(app_id)
+            return True, "✅ Уже в библиотеке!"
+        if verified == 'FREE_LICENSE_DISABLED':
+            return False, "🚫 Раздача этой игры уже завершена (Free License Disabled)"
+        if verified == 'ERROR_RATE_LIMIT_EXCEEDED':
+            return False, self._ADD_ERRORS['rate']
+
+        # Понятная ошибка из JSON error_code вместо дампа HTML
+        if isinstance(err, tuple) and len(err) >= 3:
+            ec, em = str(err[1] or ''), str(err[2] or '')
+            logger.warning(f"❌ Не удалось добавить {app_id} (subid={subid}): "
+                           f"Steam вернул error_code={ec or '?'}, msg={em[:120]}")
+            return False, f"⚠️ Steam отказал: {ec or em or 'неизвестная ошибка'}".strip()[:200]
+
+        # Диагностика для лога: одна строка с кодом вместо дампа HTML
+        code = self._diagnose_html(last_text)
+        logger.warning(f"❌ Не удалось добавить {app_id} (subid={subid}): "
+                       f"Steam не принял ни один эндпоинт [диагноз: {code}]")
+        hints = {
+            'login_redirect': "❌ Steam редиректит на логин — обновите steam_cookies.json",
+            'not_logged_in': "❌ Steam требует авторизацию — обновите steam_cookies.json",
+            'region': "🌍 Игра недоступна в регионе вашего аккаунта",
+            'maintenance': "🛠 Steam временно недоступен — повторите позже",
+            'unknown': "⚠️ Steam не подтвердил добавление (подробности в логе)",
+        }
+        return False, hints.get(code, hints['unknown'])
+
+    @staticmethod
+    def _diagnose_html(text: Optional[str]) -> str:
+        """Сводит HTML-ответ Steam к короткому коду для лога/подсказки."""
+        if not text:
+            return 'empty'
+        low = text.lower()
+        if 'login?redir' in low or 'sign in' in low and 'steam' in low:
+            return 'login_redirect'
+        if 'js_g_loginrequired' in low or 'not logged in' in low or 'войдите' in low:
+            return 'not_logged_in'
+        if 'available in your region' in low or 'недоступна в вашем регионе' in low \
+                or 'unavailableincountry' in low:
+            return 'region'
+        if 'under maintenance' in low or 'store is temporarily' in low:
+            return 'maintenance'
+        return 'unknown'
+
+    async def _fetch_game_snr(self, app_id: str) -> Optional[str]:
+        """Достаёт валидный snr страницы игры (нужен legacy-эндпоинтам)."""
+        status, text, _ = await self._request(
+            'GET', f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')
+        if status != 200 or not text:
+            return None
+        m = re.search(r'snr[=:]\s*[\'"]?([\w.#]+)', text)
+        return m.group(1) if m else None
+
 
     @staticmethod
     def _parse_add_response(status: int, text: Optional[str],
@@ -899,15 +1103,20 @@ class SteamSession:
                  or 'has been added' in low)
         already = ('already in your library' in low or 'уже в библиотеке' in low
                    or 'already_own' in low or 'already owned' in low)
-        if added:
+        # ФИКС (DLC): страница DLC с базовой игрой в библиотеке содержит
+        # «owned»-тексты, которые матчились как already/added ложно.
+        # Если это HTML-страница (не AJAX-JSON), такие совпадения не считаются
+        # успехом — реальное добавление подтвердит только addfreetrial.
+        is_html_page = ('<!doctype html>' in low or '<html' in low)
+        if added and not is_html_page:
             return True, False, None
-        if already:
+        if already and not is_html_page:
             return False, True, None
         if 'rate limit' in low or 'too many' in low:
             return False, False, 'rate'
         if 'cart' in low and ('remove' in low or 'empty' in low):
             return False, False, 'cart'
-        if '<!doctype html>' in low or '<html' in low:
+        if is_html_page:
             # HTML вместо JSON = эндпоинт не принял запрос (не залогинены или
             # игра не free-license) — НЕ считаем сессию умершей автоматически
             return False, False, 'html'
@@ -1311,7 +1520,7 @@ class SteamBot:
                 except TelegramError:
                     pass
 
-            new_games, added_games = [], []
+            new_games, added_games, skipped_dlc = [], [], []
             for game in all_games:
                 if is_scheduled:
                     known = await self.db.execute_query(
@@ -1320,11 +1529,36 @@ class SteamBot:
                     if known:
                         continue
 
-                in_library = game.is_owned or await self.steam.is_game_owned(game.app_id)
-                game.is_owned = in_library
-                if in_library:
-                    await self.db.add_or_update_game(game)
-                    continue
+                # --- ФИКС (DLC): детали грузим ДО любых проверок — иначе тип
+                # приложения неизвестен. DLC показываем и добавляем только
+                # если базовая игра есть в библиотеке (запрос пользователя).
+                await self.steam.get_game_details(game)
+                if game.is_dlc:
+                    parent = await self.steam.resolve_parent_game(game)
+                    if parent is not None:
+                        game.parent_app_id = parent.app_id
+                        game.parent_game_name = game.parent_game_name or parent.name
+                        has_base = await self.steam.is_game_owned(parent.app_id)
+                    else:
+                        # родитель не определён (appdetails не отдал fullgame) —
+                        # безопасный вариант: не спамим и не пробуем добавлять
+                        has_base = False
+                        logger.info(f"🧩 {game.app_id}: родитель DLC не определён → пропуск")
+                    if not has_base:
+                        skipped_dlc.append(game)
+                        logger.info(f"🧩 Пропуск DLC «{game.name}»: базовая игра "
+                                    f"«{game.parent_game_name or 'неизвестна'}» не в библиотеке")
+                        continue
+                    game.is_owned = await self.steam.is_game_owned(game.app_id)
+                    if game.is_owned:
+                        await self.db.add_or_update_game(game)
+                        continue
+                else:
+                    in_library = game.is_owned or await self.steam.is_game_owned(game.app_id)
+                    game.is_owned = in_library
+                    if in_library:
+                        await self.db.add_or_update_game(game)
+                        continue
 
                 new_games.append(game)
 
@@ -1364,8 +1598,8 @@ class SteamBot:
 
             delivered_app_ids = []
             for game in new_games:
-                # подробная информация (картинка + описание на русском)
-                await self.steam.get_game_details(game)
+                # подробности уже загружены в цикле выше (get_game_details);
+                # для DLC дополнительно укажем базовую игру в extra
                 kb = self._game_kb(game.app_id, game.is_owned)
                 if await self._send_game_card(chat_id, game, kb):
                     delivered_app_ids.append(game.app_id)
@@ -1383,6 +1617,19 @@ class SteamBot:
                                       f"{len(added_games)}</b>\n{names}")
             elif not new_games and not is_scheduled:
                 await self._send_safe(chat_id, "✅ Проверка завершена. Новых игр нет.")
+
+            # DLC без базовой игры не показываем поштучно, но информируем одним
+            # сообщением (чтобы пользователь знал, что бот их видит и фильтрует)
+            if skipped_dlc and not is_scheduled:
+                lines = [f"• <b>{self.steam._esc(g.name)}</b>"
+                         + (f" — нужна «{self.steam._esc(g.parent_game_name)}»"
+                            if g.parent_game_name else "")
+                         for g in skipped_dlc[:15]]
+                more = (f"\n…и ещё {len(skipped_dlc) - 15}" if len(skipped_dlc) > 15 else "")
+                await self._send_safe(
+                    chat_id,
+                    f"🧩 <b>DLC скрыто ({len(skipped_dlc)})</b> — показываю бесплатные "
+                    f"DLC только если базовая игра в библиотеке:\n" + "\n".join(lines) + more)
 
     async def manual_check(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await self._restricted(update):
@@ -1529,6 +1776,26 @@ class SteamBot:
         if not game.details_loaded:
             await self.steam.get_game_details(game)
             self._details_cache[app_id] = game
+
+        # --- ФИКС (DLC): ручное добавление DLC тоже только с базовой игрой ---
+        if game.is_dlc:
+            parent = await self.steam.resolve_parent_game(game)
+            if parent is not None:
+                game.parent_app_id = parent.app_id
+                game.parent_game_name = game.parent_game_name or parent.name
+                has_base = await self.steam.is_game_owned(parent.app_id)
+            else:
+                has_base = False
+            if not has_base:
+                pname = self.steam._esc(game.parent_game_name or 'неизвестна')
+                await self._edit_card(
+                    query, game,
+                    f"\n\n🧩 <b>DLC не добавлен</b>\nБазовая игра «{pname}» "
+                    f"отсутствует в библиотеке — DLC бесполезен без неё.",
+                    InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔗 Открыть в Steam",
+                                             url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
+                return
 
         soup = await self.steam.get_page_soup(app_id)
         if not soup:

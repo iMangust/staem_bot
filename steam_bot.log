@@ -1,0 +1,61 @@
+2026-10-02 03:14:01,380 - steam_bot_v2 - WARNING - ⏰ Cookie 'recentapps' просрочена (истекла 3.0 дн. назад)
+2026-10-02 03:14:01,381 - steam_bot_v2 - WARNING - ⏰ Cookie 'ak_bmsc' просрочена (истекла 126.1 дн. назад)
+2026-10-02 03:14:01,381 - steam_bot_v2 - WARNING - ⏰ Cookie 'recentapps' просрочена (истекла 36.1 дн. назад)
+2026-10-02 03:14:01,381 - steam_bot_v2 - WARNING - ⏰ Cookie 'ak_bmsc' просрочена (истекла 126.1 дн. назад)
+2026-10-02 03:14:01,381 - steam_bot_v2 - WARNING - ⏰ Cookie 'recentapps' просрочена (истекла 36.1 дн. назад)
+2026-10-02 03:14:01,381 - steam_bot_v2 - WARNING - ⚠️ В файле cookies 4 просроченных записей — экспортируйте steam_cookies.json заново из браузера
+2026-10-02 03:14:01,381 - steam_bot_v2 - INFO - 🍪 Cookies загружены из файла (steam_id=76561198042098082, sessionid=yes, просрочено=4)
+2026-10-02 03:14:01,381 - steam_bot_v2 - WARNING - ⚠️ owned_games_cache.json принадлежит другому аккаунту (999999 ≠ 76561198042098082) — игнорирую его
+2026-10-02 03:14:01,382 - steam_bot_v2 - INFO - 📚 Загружен кэш библиотеки: 2 игр
+2026-10-02 03:14:33,602 - steam_bot_v2 - ERROR - 🚨 Сессия Steam ПРЕРВАНА, автовосстановление не удалось — нужно обновить steam_cookies.json
+2026-10-02 03:14:41,119 - steam_bot_v2 - ERROR - 🚨 Сессия Steam ПРЕРВАНА, автовосстановление не удалось — нужно обновить steam_cookies.json
+2026-10-02 03:14:43,848 - steam_bot_v2 - ERROR - 🚨 Сессия Steam ПРЕРВАНА, автовосстановление не удалось — нужно обновить steam_cookies.json
+2026-10-02 03:14:52,292 - steam_bot_v2 - ERROR - 🚨 Сессия Steam ПРЕРВАНА, автовосстановление не удалось — нужно обновить steam_cookies.json
+2026-10-02 03:14:52,292 - steam_bot_v2 - INFO - ♻️ Сессия Steam восстановлена автоматически
+2026-10-02 03:51:52,550 - steam_bot_v2 - INFO - ✅ База данных инициализирована
+2026-10-02 03:52:03,360 - steam_bot_v2 - INFO - ✅ База данных инициализирована
+2026-10-02 03:58:39,831 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 03:59:07,511 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 03:59:07,511 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 03:59:07,511 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 03:59:25,751 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 03:59:25,751 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 04:00:57,765 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 04:01:34,459 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 04:01:34,459 - steam_bot_v2 - INFO - 🎮 Попытка добавить 5067220 (subid=1835073)
+2026-10-02 04:01:34,459 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 04:01:34,459 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:01:34,459 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:01:34,459 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=Free License Disabled
+2026-10-02 04:02:03,828 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:03,828 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=some steam message
+2026-10-02 04:02:03,828 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:03,828 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:03,828 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=ERROR_NO_LICENSE, msg=some steam message
+2026-10-02 04:02:23,373 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:23,373 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=some steam message
+2026-10-02 04:02:23,373 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:23,373 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:23,373 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=ERROR_NO_LICENSE, msg=some steam message
+2026-10-02 04:02:23,374 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:23,374 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:23,374 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 04:02:23,374 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 04:02:23,374 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:40,572 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:40,572 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=some steam message
+2026-10-02 04:02:40,572 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:40,572 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:40,573 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=ERROR_NO_LICENSE, msg=some steam message
+2026-10-02 04:02:40,573 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:40,573 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:40,573 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 04:02:40,573 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=, msg=None
+2026-10-02 04:02:40,573 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:53,073 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=some steam message
+2026-10-02 04:02:53,073 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:02:53,073 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=some steam message
+2026-10-02 04:03:16,811 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:03:16,812 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=Free License Disabled
+2026-10-02 04:03:27,330 - steam_bot_v2 - INFO - 🎮 Попытка добавить 111 (subid=222)
+2026-10-02 04:03:27,330 - steam_bot_v2 - INFO - ℹ️ Ответ Steam (JSON): error_code=FREE_LICENSE_DISABLED, msg=Free License Disabled
