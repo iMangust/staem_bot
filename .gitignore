@@ -1,1 +1,9 @@
-(empty)
+__pycache__/
+*.pyc
+*.log
+.env
+steam_bot.db
+steam_cookies.json
+bot_settings.json
+owned_games_cache.json
+steam_bot.py
