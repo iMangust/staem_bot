@@ -287,6 +287,24 @@ class SteamSession:
         self._reloading_cookies = False
 
     # ---------- cookies ----------
+    @staticmethod
+    def _check_cookie_expiry(raw: list) -> int:
+        """Возвращает количество ПРОТУХШИХ cookie с явным expirationDate.
+        ФИКС: раньше бот молча работал протухшими cookies и «терял» сессию —
+        теперь срок жизни проверяется явно и виден в логах."""
+        expired = 0
+        now = time.time()
+        for c in raw:
+            exp = c.get('expirationDate')
+            try:
+                if exp and float(exp) < now:
+                    expired += 1
+                    logger.warning("⏰ Cookie '%s' просрочена (истекла %.1f дн. назад)",
+                                   c.get('name'), (now - float(exp)) / 86400)
+            except (TypeError, ValueError):
+                pass
+        return expired
+
     def load_cookies_from_file(self) -> bool:
         """Читает steam_cookies.json (формат расширения EditThisCookie)."""
         if not self.cookies_file.exists():
@@ -309,9 +327,13 @@ class SteamSession:
                     session_id = value
             if not cookies:
                 return False
+            expired = self._check_cookie_expiry(raw)
+            if expired:
+                logger.warning(f"⚠️ В файле cookies {expired} просроченных записей — "
+                               f"экспортируйте steam_cookies.json заново из браузера")
             self.cookies, self.steam_id, self.session_id = cookies, steam_id, session_id
-            logger.info("🍪 Cookies загружены из файла (steam_id=%s, sessionid=%s)",
-                        steam_id, 'yes' if session_id else 'NO')
+            logger.info("🍪 Cookies загружены из файла (steam_id=%s, sessionid=%s, просрочено=%d)",
+                        steam_id, 'yes' if session_id else 'NO', expired)
             return True
         except Exception as e:
             logger.error(f"❌ Ошибка загрузки cookies: {e}")
@@ -452,6 +474,13 @@ class SteamSession:
         try:
             if OWNED_GAMES_CACHE_FILE.exists():
                 data = json.loads(OWNED_GAMES_CACHE_FILE.read_text(encoding='utf-8'))
+                cache_sid = data.get('steam_id')
+                # ФИКС: если файл кэша от ДРУГОГО аккаунта Steam — не подмешиваем
+                # его игры в текущую библиотеку (иначе «уже в библиотеке» врёт)
+                if cache_sid and self.steam_id and str(cache_sid) != str(self.steam_id):
+                    logger.warning("⚠️ owned_games_cache.json принадлежит другому аккаунту "
+                                   f"({cache_sid} ≠ {self.steam_id}) — игнорирую его")
+                    return
                 ids = {str(x) for x in data.get('app_ids', [])}
                 file_ts = float(data.get('timestamp') or 0)
                 # файл новее текущего состояния в памяти — принимаем его целиком,
@@ -923,6 +952,7 @@ class SteamBot:
         self.db = DatabaseManager()
         self.app: Optional[Application] = None
         self._check_lock = asyncio.Lock()  # защита от параллельных проверок
+        self._session_dead_notified = False  # не спамить админу повторными алертами
 
     async def initialize(self):
         await self.steam.init()
@@ -1454,15 +1484,26 @@ class SteamBot:
 
     async def auth_watchdog(self, context: ContextTypes.DEFAULT_TYPE):
         """Каждые 15 минут проверяем, жива ли сессия Steam; при смерти —
-        пробуем восстановить из файла cookies и уведомляем админа."""
+        пробуем восстановить из файла cookies и уведомляем админа.
+        Алерт-машина состояний: «смерть» -> 1 алерт (без спама каждые 15 мин),
+        «восстановление» -> 1 подтверждение. Уведомления дублируются в лог,
+        чтобы не потерять тревогу, если Telegram недоступен."""
         was = self.steam.logged_in
         ok = await self.steam.check_auth()
         if not ok:
             ok = await self.steam.try_recover_session()
+        # Синхронизируем флаг авторизации с реальным состоянием (иначе
+        # «зависевший» logged_in=True глушит recovery в add_free_game)
+        self.steam.logged_in = bool(ok)
         if ok and not was:
+            self._session_dead_notified = False
+            logger.info("♻️ Сессия Steam восстановлена автоматически")
             await self._send_safe(BOT_CONFIG['admin_id'],
                                   "♻️ Сессия Steam восстановлена автоматически.")
-        elif not ok and was:
+        elif not ok and not self._session_dead_notified:
+            self._session_dead_notified = True
+            logger.error("🚨 Сессия Steam ПРЕРВАНА, автовосстановление не удалось — "
+                         "нужно обновить steam_cookies.json")
             await self._send_safe(BOT_CONFIG['admin_id'],
                                   "🚨 Сессия Steam ПРЕРВАНА и автовосстановление не удалось.\n"
                                   "Откройте Steam в браузере, экспортируйте cookies "
