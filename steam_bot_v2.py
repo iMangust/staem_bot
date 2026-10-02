@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
 from enum import Enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -138,6 +138,22 @@ class GameInfo:
     discount_percent: Optional[str] = None
     is_owned: bool = False
     discount_value: int = 0
+    # подробная информация из appdetails (на русском, cc=ru&l=russian)
+    header_image: Optional[str] = None
+    short_description: Optional[str] = None
+    genres: List[str] = field(default_factory=list)
+    platforms: str = ""
+    languages: str = ""
+    release_date: str = ""
+    developers: str = ""
+    publishers: str = ""
+    type_name: str = ""
+    is_free: bool = False
+    details_loaded: bool = False
+
+    def __post_init__(self):
+        if self.genres is None:
+            self.genres = []
 
 
 class RateLimiter:
@@ -651,6 +667,99 @@ class SteamSession:
             return None
         return BeautifulSoup(text, 'html.parser')
 
+    # ---------- подробная информация о игре (русский язык) ----------
+    async def get_game_details(self, game: GameInfo) -> GameInfo:
+        """Загружает картинку и описание через публичный appdetails API
+        с cc=ru&l=russian — Steam сам отдаёт локализованные данные.
+        Ошибки не мешают основному флоу: просто без деталей."""
+        try:
+            status, text, data = await self._request(
+                'GET', 'https://store.steampowered.com/api/appdetails',
+                params={'appids': game.app_id, 'cc': 'ru', 'l': 'russian'},
+                expect_json=True)
+            if status != 200 or not isinstance(data, dict):
+                return game
+            entry = data.get(str(game.app_id)) or {}
+            if not entry.get('success'):
+                return game
+            d = entry.get('data') or {}
+            game.header_image = d.get('header_image')
+            sd = d.get('short_description') or ''
+            game.short_description = BeautifulSoup(sd, 'html.parser').get_text(' ', strip=True)
+            game.genres = [g.get('description', '') for g in d.get('genres', [])
+                           if g.get('description')]
+            p = d.get('platforms') or {}
+            pf = []
+            if p.get('windows'):
+                pf.append('Windows')
+            if p.get('mac'):
+                pf.append('macOS')
+            if p.get('linux'):
+                pf.append('Linux')
+            game.platforms = ' · '.join(pf)
+            langs = BeautifulSoup(d.get('supported_languages') or '', 'html.parser')\
+                .get_text(',', strip=True)
+            ru = re.search(r'русск[^\s,]*', langs, flags=re.I)
+            game.languages = ('есть русский ✅' if ru else langs[:120] or '—')
+            game.release_date = ((d.get('release_date') or {}).get('date') or '').strip()
+            game.developers = ', '.join(d.get('developers') or [])
+            game.publishers = ', '.join(d.get('publishers') or [])
+            tp = {'game': 'Игра', 'dlc': 'DLC / дополнение',
+                  'software': 'Программа'}.get(d.get('type'), d.get('type') or '')
+            game.type_name = tp
+            game.is_free = bool(d.get('is_free'))
+            fullgame = d.get('fullgame') or {}
+            if fullgame.get('appid') and not game.original_price:
+                game.name = game.name or d.get('name', '')
+            game.details_loaded = True
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось получить детали {game.app_id}: {e}")
+        return game
+
+    @staticmethod
+    def _esc(s: str) -> str:
+        return (s or '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    def format_game_card(self, game: GameInfo, extra: str = "",
+                         header_prefix: str = "🎮") -> Tuple[str, Optional[str]]:
+        """Собирает HTML-текст карточки + URL картинки (или None)."""
+        esc_name = self._esc(game.name)
+        lines = [f"{header_prefix} <b>{esc_name}</b>"]
+        price = ""
+        if game.discount_percent and game.original_price:
+            price = (f"💰 <s>{self._esc(game.original_price)}</s> → "
+                     f"<b>{self._esc(game.final_price or 'Бесплатно')}</b> "
+                     f"(<b>{self._esc(game.discount_percent)}</b>)")
+        elif game.final_price or game.original_price:
+            price = f"💰 {self._esc(game.final_price or game.original_price)}"
+        else:
+            price = "💰 Бесплатно"
+        lines.append(price)
+        meta = []
+        if game.type_name:
+            meta.append(game.type_name)
+        meta.extend(game.genres[:4])
+        if game.release_date:
+            meta.append(f"выход: {game.release_date}")
+        if meta:
+            lines.append("🏷️ " + self._esc(' · '.join(meta)))
+        if game.platforms:
+            lines.append("💻 " + self._esc(game.platforms))
+        if game.languages:
+            lines.append("🗣️ " + self._esc(game.languages))
+        who = ' · '.join(x for x in (game.developers, game.publishers) if x)
+        if who:
+            lines.append("🏢 " + self._esc(who))
+        if game.short_description:
+            desc = self._esc(game.short_description)[:700]
+            lines.append(f"\n<i>{desc}</i>")
+        lines.append(f'\n🔗 <a href="{game.url}">Открыть в Steam</a>')
+        if extra:
+            lines.append(extra)
+        img = game.header_image if (game.header_image and
+                                    game.header_image.startswith('http')) else None
+        return "\n".join(lines), img
+
     @staticmethod
     def extract_purchase_params(soup: BeautifulSoup) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         subid = snr = originating_snr = None
@@ -665,19 +774,32 @@ class SteamSession:
                 snr = val
             elif name == 'originating_snr' and not originating_snr:
                 originating_snr = val
+        # ФИКС: для бесплатных DLC кнопки «Add to library» вызывают JS вида
+        # AddFreeToLibrary( 1835073 ) / ajaxaddfreebgame c ключом подписки —
+        # если формы нет, достаём subid из скриптов страницы.
+        if not subid:
+            scripts = ''.join(s.get_text() for s in soup.find_all('script'))
+            m = re.search(r'(?:AddFreeGame|AddFreeToLibrary|ajaxaddfreebgame)[^0-9]{0,80}(\d{4,9})',
+                          scripts)
+            if not m:
+                m = re.search(r'[?&]subid=(\d+)', scripts)
+            if m:
+                subid = m.group(1)
         return subid, snr, originating_snr
 
     async def add_free_game(self, app_id: str, subid: str,
                             snr: Optional[str] = None,
                             originating_snr: Optional[str] = None) -> Tuple[bool, str]:
         """
-        Добавляет бесплатную игру через /freelicense/addfreelicense/.
-        ФИКС №1: правильный матчинг реальных текстов Steam
-               ("has been added to your library" / "already in your library").
-        ФИКС №2: после "успеха" игра верифицируется приватным
-               ajax-эндпоинтом /api/addfreetrial (он идемпотентен) —
-               именно там Steam честно отвечает ALREADY_IN_LIBRARY /
-               SUCCESS, и только тогда игра помечается как owned.
+        Добавляет бесплатную игру/бесплатный DLC в библиотеку.
+        ФИКС №0 (главный): Steam возвращал HTML-страницу вместо JSON, потому
+        что запрос шёл на /freelicense/addfreelicense/ — а этот эндпоинт
+        существует только для special-kinds (free-on-pro). Для обычных
+        free-license и БЕСПЛАТНЫХ DLC (как «Rotwood: Drakin Armoury Pack»)
+        правильный эндпоинт — /ajaxaddfreebgame/ (он же используется
+        кнопкой «Add to your library» на странице игры).
+        Порядок попыток: ajaxaddfreebgame → addfreelicense; успех
+        верифицируется идемпотентным /api/addfreetrial.
         """
         if not self.logged_in:
             if not await self.check_auth():
@@ -685,16 +807,6 @@ class SteamSession:
         if not self.session_id:
             return False, "❌ Нет sessionid в cookies"
 
-        data = {
-            'action': 'add_to_cart',
-            'sessionid': self.session_id,
-            'packageid': '',
-            'subid': subid,
-            'snr': snr or '1_5_9__403',
-            'originating_snr': originating_snr or '1_direct-navigation__',
-            'wants_gift': '0',
-            'duplicate_allowed': '0',
-        }
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
             'Origin': STEAM_CONFIG['api_store'],
@@ -702,39 +814,111 @@ class SteamSession:
             'X-Requested-With': 'XMLHttpRequest',
         }
         logger.info(f"🎮 Попытка добавить {app_id} (subid={subid})")
-        status, text, _ = await self._request(
-            'POST', f'{STEAM_CONFIG["api_store"]}/freelicense/addfreelicense/',
-            data=data, headers=headers)
-        if status == 0 or text is None:
-            return False, "❌ Сетевая ошибка при добавлении"
 
-        low = text.lower()
-        added_now = ('added to your library' in low or 'вашу библиотеку' in low
-                      or 'has been added' in low)
-        already = ('already in your library' in low or 'уже в библиотеке' in low
-                   or 'already_own' in low or 'already owned' in low)
-        rate_limited = 'rate limit' in low or 'too many' in low
-        needs_cart = 'cart' in low and ('remove' in low or 'empty' in low)
+        # 1) основной путь: /ajaxaddfreebgame/ (работает и для DLC)
+        data = {
+            'sessionid': self.session_id,
+            'key': subid,
+            'method': 'web',
+            'country_code': 'RU',
+        }
+        status, text, j = await self._request(
+            'POST', f'{STEAM_CONFIG["api_store"]}/ajaxaddfreebgame/',
+            data=data, headers=headers, expect_json=True)
+        added_now, already, err = self._parse_add_response(status, text, j)
 
-        if needs_cart:
-            return False, "⚠️ Корзина не пуста — очистите её в Steam"
-        if rate_limited:
-            return False, "⚠️ Steam ограничил частоту, повторите позже"
+        # 2) запасной путь: /freelicense/addfreelicense/ (special kinds)
+        if not (added_now or already):
+            data2 = {
+                'action': 'add_to_cart',
+                'sessionid': self.session_id,
+                'packageid': '',
+                'subid': subid,
+                'snr': snr or '1_5_9__403',
+                'originating_snr': originating_snr or '1_direct-navigation__',
+                'wants_gift': '0',
+                'duplicate_allowed': '0',
+            }
+            status2, text2, j2 = await self._request(
+                'POST', f'{STEAM_CONFIG["api_store"]}/freelicense/addfreelicense/',
+                data=data2, headers=headers, expect_json=True)
+            a2, k2, e2 = self._parse_add_response(status2, text2, j2)
+            added_now, already = added_now or a2, already or k2
+            if not (added_now or already):
+                err = e2 or err
+                if isinstance(e2, tuple):
+                    return False, self._ADD_ERRORS.get(e2, "⚠️ Steam не подтвердил добавление")
+
+        if isinstance(err, tuple):
+            return False, self._ADD_ERRORS.get(err, "⚠️ Steam не подтвердил добавление")
 
         if added_now or already:
             verified = await self._verify_free_license(app_id, subid)
             if verified in ('SUCCESS', 'ALREADY_IN_LIBRARY'):
                 self.mark_game_owned(app_id)
-                await self.close()  # на всякий случай сбрасываем соединение
-                msg = "✅ Игра добавлена в библиотеку!" if verified == 'SUCCESS' else "✅ Уже в библиотеке!"
+                msg = ("✅ Игра добавлена в библиотеку!" if verified == 'SUCCESS'
+                       else "✅ Уже в библиотеке!")
                 return True, msg
-            # текст обещал успех, но верификация не подтвердила
-            logger.warning(f"⚠️ {app_id}: Steam ответил успешно, но верификация не подтвердила")
-            self.mark_game_owned(app_id)  # трастуем первичный ответ, фиксируем в кэш
-            return True, "✅ Добавлено (верификация не подтверждена)"
+            # текст обещал успех, но addfreetrial не подтвердил — доверяем
+            # первичному ответу (для DLC addfreetrial может быть недоступен)
+            logger.info(f"ℹ️ {app_id}: верификация через addfreetrial не подтвердила "
+                        f"(результат: {verified}); фиксируем по ответу эндпоинта добавления")
+            self.mark_game_owned(app_id)
+            return True, ("✅ Добавлено в библиотеку!" if added_now
+                          else "✅ Уже в библиотеке!")
 
-        logger.warning(f"❌ Неожиданный ответ Steam на добавление {app_id}: {text[:200]}")
+        logger.warning(f"❌ Неожиданный ответ Steam на добавление {app_id}: "
+                       f"{(text or '')[:200]}")
         return False, "⚠️ Steam не подтвердил добавление"
+
+    @staticmethod
+    def _parse_add_response(status: int, text: Optional[str],
+                            j: Optional[dict]) -> Tuple[bool, bool, object]:
+        """Разбирает ответ ajaxaddfreebgame/addfreelicense.
+        Возвращает (добавлена_сейчас, уже_была, ошибка_или_None)."""
+        if status == 0 or text is None:
+            return False, False, 'network'
+        if isinstance(j, dict) and 'success' in j:
+            if j.get('success'):
+                return True, False, None
+            ec = str(j.get('error_code') or '')
+            em = str(j.get('error_message') or '').lower()
+            low_em = em.lower()
+            if ec == 'Already_Purchased' or 'already owned' in low_em or 'уже в библиотеке' in low_em:
+                return False, True, None
+            if 'rate limit' in low_em or 'too many' in low_em:
+                return False, False, 'rate'
+            if 'guest' in low_em or 'login' in low_em:
+                return False, False, 'auth'
+            if 'shopping cart' in low_em or 'корзин' in low_em:
+                return False, False, 'cart'
+            logger.info(f"ℹ️ Ответ Steam (JSON): error_code={ec}, msg={j.get('error_message')}")
+            return False, False, ('json', ec, em)
+        low = text.lower()
+        added = ('added to your library' in low or 'вашу библиотеку' in low
+                 or 'has been added' in low)
+        already = ('already in your library' in low or 'уже в библиотеке' in low
+                   or 'already_own' in low or 'already owned' in low)
+        if added:
+            return True, False, None
+        if already:
+            return False, True, None
+        if 'rate limit' in low or 'too many' in low:
+            return False, False, 'rate'
+        if 'cart' in low and ('remove' in low or 'empty' in low):
+            return False, False, 'cart'
+        if '<!doctype html>' in low or '<html' in low:
+            # HTML вместо JSON = эндпоинт не принял запрос (не залогинены или
+            # игра не free-license) — НЕ считаем сессию умершей автоматически
+            return False, False, 'html'
+        return False, False, None
+
+    _ADD_ERRORS = {
+        'network': "❌ Сетевая ошибка при добавлении",
+        'rate': "⚠️ Steam ограничил частоту запросов — повторите позже",
+        'auth': "❌ Steam не принимает сессию — обновите steam_cookies.json",
+        'cart': "⚠️ Корзина не пуста — очистите её в Steam",
+    }
 
     async def _verify_free_license(self, app_id: str, subid: str) -> Optional[str]:
         """Идемпотентная проверка статуса free-license. Возвращает
@@ -967,6 +1151,7 @@ class SteamBot:
         self.app: Optional[Application] = None
         self._check_lock = asyncio.Lock()  # защита от параллельных проверок
         self._session_dead_notified = False  # не спамить админу повторными алертами
+        self._details_cache: Dict[str, GameInfo] = {}  # app_id -> карточка (для edit/деталей)
 
     async def initialize(self):
         await self.steam.init()
@@ -1016,6 +1201,39 @@ class SteamBot:
                                             reply_markup=reply_markup, disable_web_page_preview=True)
         except TelegramError as e:
             logger.warning(f"⚠️ Не удалось отправить сообщение: {e}")
+
+    async def _send_game_card(self, chat_id: int, game: GameInfo, kb,
+                              extra: str = "", header_prefix: str = "🎮") -> bool:
+        """Отправляет карточку игры: с картинкой (header image), если она
+        есть и доступна Telegram; иначе — текстом. Возвращает True, если
+        сообщение реально доставлено."""
+        text, img = self.steam.format_game_card(game, extra=extra,
+                                                header_prefix=header_prefix)
+        bot = self.app.bot
+        if img and len(text) <= 1024:
+            try:
+                await bot.send_photo(chat_id, photo=img, caption=text,
+                                     parse_mode=ParseMode.HTML, reply_markup=kb)
+                self._details_cache[game.app_id] = game
+                return True
+            except TelegramError as e:
+                logger.info(f"ℹ️ Картинку {game.app_id} отправить не удалось "
+                            f"({e.__class__.__name__}) — отправлю текстом")
+        # без картинки (или caption длиннее лимита 1024) — обычное сообщение
+        if len(text) > 4096:
+            overflow = len(text) - 4096
+            desc = game.short_description or ''
+            game.short_description = desc[:max(0, len(desc) - overflow)]
+            text, _ = self.steam.format_game_card(game, extra=extra,
+                                                  header_prefix=header_prefix)
+        try:
+            await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                   reply_markup=kb, disable_web_page_preview=True)
+            self._details_cache[game.app_id] = game
+            return True
+        except TelegramError as e:
+            logger.warning(f"⚠️ Не удалось отправить сообщение: {e}")
+            return False
 
     # ---------------- команды ----------------
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1144,13 +1362,19 @@ class SteamBot:
                 except TelegramError:
                     pass
 
+            delivered_app_ids = []
             for game in new_games:
-                text = (f"🎮 <b>{game.name}</b>\n"
-                        f"💰 {game.original_price or 'N/A'} → {game.final_price or 'Бесплатно'}"
-                        f" ({game.discount_percent or '100%'})\n"
-                        f"🔗 <a href=\"{game.url}\">Открыть в Steam</a>")
+                # подробная информация (картинка + описание на русском)
+                await self.steam.get_game_details(game)
                 kb = self._game_kb(game.app_id, game.is_owned)
-                await self._send_safe(chat_id, text, kb)
+                if await self._send_game_card(chat_id, game, kb):
+                    delivered_app_ids.append(game.app_id)
+
+            # помечаем уведомлёнными только реально доставленные игры —
+            # иначе при сбое Telegram следующая проверка их «потеряет»
+            for app_id in delivered_app_ids:
+                await self.db.execute_query(
+                    "UPDATE known_games SET notified = 1 WHERE app_id = ?", (app_id,))
 
             if added_games:
                 names = "\n".join(f"• {g.name}" for g in added_games[:20])
@@ -1252,12 +1476,9 @@ class SteamBot:
             for i, g in enumerate(games, 1):
                 emoji = ("🔥" if g.discount_value >= 75 else "🎯" if g.discount_value >= 50
                          else "💎" if g.discount_value >= 25 else "🏷️")
-                text = (f"{emoji} <b>#{i} {g.name}</b>\n"
-                        f"💰 <s>{g.original_price or 'N/A'}</s> → <b>{g.final_price or 'N/A'}</b>\n"
-                        f"📉 Скидка: <b>{g.discount_percent or '-'}</b>\n"
-                        f"🔗 <a href=\"{g.url}\">Открыть в Steam</a>")
-                await self._send_safe(chat_id, text,
-                                      self._game_kb(g.app_id, g.is_owned, is_discount=True))
+                await self.steam.get_game_details(g)
+                kb = self._game_kb(g.app_id, g.is_owned, is_discount=True)
+                await self._send_game_card(chat_id, g, kb, header_prefix=f"{emoji} #{i}")
                 if i % 5 == 0:
                     await asyncio.sleep(1.0)  # уважение к лимитам Telegram
 
@@ -1276,13 +1497,17 @@ class SteamBot:
         query = update.callback_query
         if await self._restricted(update):
             return
-        if query.data == "already_owned":
+        data = query.data or ""
+        if data == "already_owned":
             await query.answer("📚 Эта игра уже в вашей библиотеке!", show_alert=True)
             return
-        if not query.data.startswith('add:'):
+        if data.startswith('details:'):
+            await self._show_details(query, data.split(':', 1)[1])
+            return
+        if not data.startswith('add:'):
             return
 
-        app_id = query.data.split(':')[1]
+        app_id = data.split(':')[1]
         if not self.steam.logged_in and not await self.steam.check_auth():
             await query.answer("❌ Steam не авторизован. Обновите steam_cookies.json.",
                                show_alert=True)
@@ -1298,54 +1523,89 @@ class SteamBot:
                 pass
             return
 
-        original_text = query.message.text_html if query.message.text else None
+        # карточка для редактирования сообщения — берём из кэша деталей
+        game = self._details_cache.get(app_id) or GameInfo(
+            app_id=app_id, name=app_id, url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')
+        if not game.details_loaded:
+            await self.steam.get_game_details(game)
+            self._details_cache[app_id] = game
+
         soup = await self.steam.get_page_soup(app_id)
         if not soup:
-            if original_text:
-                await query.edit_message_text(
-                    f"{original_text}\n\n❌ <b>Страница не загрузилась</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔄 Повторить", callback_data=f"add:{app_id}"),
-                        InlineKeyboardButton("🔗 Steam",
-                                             url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
+            await self._edit_card(query, game, "\n\n❌ <b>Страница не загрузилась</b>",
+                                  InlineKeyboardMarkup([[
+                                      InlineKeyboardButton("🔄 Повторить", callback_data=f"add:{app_id}"),
+                                      InlineKeyboardButton("🔗 Steam",
+                                                           url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
             return
 
         subid, snr, osnr = self.steam.extract_purchase_params(soup)
         if not subid:
-            if original_text:
-                await query.edit_message_text(
-                    f"{original_text}\n\n⚠️ <b>Не найден subid — эту игру нельзя "
-                    f"добавить автоматически</b> (откройте страницу в Steam вручную)",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔗 Открыть в Steam",
-                                             url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
+            await self._edit_card(query, game,
+                                  "\n\n⚠️ <b>Не найден subid — эту игру нельзя "
+                                  "добавить автоматически</b> (откройте страницу в Steam вручную)",
+                                  InlineKeyboardMarkup([[
+                                      InlineKeyboardButton("🔗 Открыть в Steam",
+                                                           url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
             return
 
         added, msg = await self.steam.add_free_game(app_id, subid, snr, osnr)
         await self.db.log_history(app_id, 'manual_added' if added else 'add_failed')
-        # фиксируем в БД, чтобы игра появилась в истории/статистике
-        game = GameInfo(app_id=app_id, name=(soup.title.get_text(strip=True) if soup.title else app_id),
-                        url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/', is_owned=added)
+        game.name = game.name or (soup.title.get_text(strip=True) if soup.title else app_id)
+        game.is_owned = added
         await self.db.add_or_update_game(game)
 
         if added:
             self.health.record('games_added')
-            if original_text:
-                await query.edit_message_text(
-                    f"{original_text}\n\n✅ <b>{msg}</b>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=self._game_kb(app_id, is_owned=True))
+            await self._edit_card(query, game, f"\n\n✅ <b>{msg}</b>",
+                                  self._game_kb(app_id, is_owned=True))
         else:
-            if original_text:
-                await query.edit_message_text(
-                    f"{original_text}\n\n❌ <b>Не удалось добавить</b>\n<i>{msg}</i>",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"add:{app_id}"),
-                        InlineKeyboardButton("🔗 Steam",
-                                             url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
+            await self._edit_card(query, game, f"\n\n❌ <b>Не удалось добавить</b>\n<i>{msg}</i>",
+                                  InlineKeyboardMarkup([[
+                                      InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"add:{app_id}"),
+                                      InlineKeyboardButton("🔗 Steam",
+                                                           url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')]]))
+
+    async def _edit_card(self, query, game: GameInfo, extra: str, kb):
+        """Редактирует текст карточки с кнопками; если caption длиннее лимита
+        Telegram (1024) — сокращает описание, чтобы сообщение не пропало."""
+        for limit in (1000, 600, 300, 0):
+            g = game
+            text, _ = self.steam.format_game_card(g, extra=extra)
+            if limit < 1000:
+                trimmed = GameInfo(**{**g.__dict__})
+                trimmed.short_description = (g.short_description or '')[:limit]
+                text, _ = self.steam.format_game_card(trimmed, extra=extra)
+            try:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                return
+            except TelegramError as e:
+                logger.debug(f"edit_message_text (limit={limit}): {e}")
+        # совсем край: минимальное сообщение
+        try:
+            await query.edit_message_text(
+                f"🎮 <b>{self.steam._esc(game.name)}</b>{extra}",
+                parse_mode=ParseMode.HTML, reply_markup=kb)
+        except TelegramError as e:
+            logger.warning(f"⚠️ Не удалось отредактировать сообщение: {e}")
+
+    async def _show_details(self, query, app_id: str):
+        """Кнопка «ℹ️ Подробнее»: обновляет карточку полными деталями."""
+        game = self._details_cache.get(app_id)
+        if not game or not game.details_loaded:
+            await query.answer("Загружаю подробности…")
+            game = game or GameInfo(app_id=app_id, name=app_id,
+                                    url=f'{STEAM_CONFIG["api_store"]}/app/{app_id}/')
+            await self.steam.get_game_details(game)
+            self._details_cache[app_id] = game
+        else:
+            await query.answer()
+        kb = self._game_kb(app_id, game.is_owned)
+        text, _ = self.steam.format_game_card(game)
+        try:
+            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except TelegramError as e:
+            logger.warning(f"⚠️ details: не удалось обновить карточку: {e}")
 
     # ---------------- настройки ----------------
     async def settings_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

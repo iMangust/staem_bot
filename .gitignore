@@ -8,3 +8,4 @@ steam_cookies.json
 bot_settings.json
 owned_games_cache.json
 *.bak
+steam_bot.py
