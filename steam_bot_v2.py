@@ -41,23 +41,37 @@ import aiohttp
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import TelegramError, InvalidToken
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-    MessageHandler, filters, ConversationHandler, ApplicationBuilder,
+    MessageHandler, filters, ConversationHandler, ApplicationBuilder, JobQueue,
 )
 from dotenv import load_dotenv
 
 # ============================================================================
 # НАСТРОЙКИ ПО УМОЛЧАНИЮ
 # ============================================================================
-load_dotenv()
 BASE_DIR = Path(__file__).parent.resolve()
 COOKIES_FILE = BASE_DIR / 'steam_cookies.json'
 SETTINGS_FILE = BASE_DIR / 'bot_settings.json'
 OWNED_GAMES_CACHE_FILE = BASE_DIR / 'owned_games_cache.json'
 LOG_FILE = BASE_DIR / 'steam_bot.log'
 DATABASE_FILE = BASE_DIR / 'steam_bot.db'
+
+def _init_config():
+    """Читает конфиг: значения из .env имеют приоритет над переменными окружения.
+
+    Дополнительно чинит типовые ошибки копирования токена: лишние кавычки,
+    префикс 'TELEGRAM_BOT_TOKEN=' и т.п. (из-за этого Telegram отдавал InvalidToken).
+    """
+    load_dotenv(BASE_DIR / '.env', override=True)
+    token = (os.getenv('TELEGRAM_BOT_TOKEN') or '').strip().strip('"').strip("'")
+    # если в значение случайно попали 'KEY=' — отрезаем префикс до первого ':'
+    if '=' in token and ':' in token and token.split('=')[0].isidentifier():
+        token = token.split('=', 1)[1].strip().strip('"').strip("'")
+    return {'token': token}
+
+_cfg = _init_config()
 
 STEAM_CONFIG = {
     'api_store': 'https://store.steampowered.com',
@@ -67,7 +81,7 @@ STEAM_CONFIG = {
 }
 
 BOT_CONFIG = {
-    'token': os.getenv('TELEGRAM_BOT_TOKEN'),
+    'token': _cfg['token'],
     'admin_id': int(os.getenv('ADMIN_USER_ID', '0')),
     'interval': int(os.getenv('CHECK_INTERVAL', 60)),
     'max_pages': int(os.getenv('MAX_SEARCH_PAGES', 5)),
@@ -1531,6 +1545,7 @@ def build_application(bot: SteamBot) -> Application:
                    .token(BOT_CONFIG['token'])
                    .request(request)
                    .concurrent_updates(False)
+                   .job_queue(JobQueue())   # явный инстанс: без него планировщик = None
                    .build())
 
     discount_conv = ConversationHandler(
@@ -1564,31 +1579,34 @@ def build_application(bot: SteamBot) -> Application:
     return application
 
 
-def post_init(application: Application) -> None:
+async def _post_init(application: Application) -> None:
+    # Вызывается PTB внутри уже запущенного event loop (await-колбэк).
+    # Раньше здесь был синхронный post_init + create_task — при фатальной ошибке
+    # инициализации это роняло процесс с бессмысленным «no running event loop».
     bot = application.bot_data['bot']
+    await bot.initialize()
+    if application.job_queue is None:
+        logger.error("⚠️ Планировщик недоступен (не установлен пакет APScheduler). "
+                     "Автопроверка и watchdog сессии НЕ работают! "
+                     "Выполните: pip install -r requirements.txt")
+        return
+    interval_min = int(bot.settings.get('check_interval', 60))
+    application.job_queue.run_repeating(
+        bot.scheduled_check, interval=interval_min * 60, first=90,
+        name='free_games_check')
+    application.job_queue.run_repeating(
+        bot.auth_watchdog, interval=15 * 60, first=60, name='auth_watchdog')
+    logger.info(f"🚀 Планировщик запущен: проверка каждые {interval_min} мин, "
+                f"watchdog сессии каждые 15 мин")
 
-    async def _init():
-        await bot.initialize()
-        interval_min = int(bot.settings.get('check_interval', 60))
-        application.job_queue.run_repeating(
-            bot.scheduled_check, interval=interval_min * 60, first=90,
-            name='free_games_check')
-        application.job_queue.run_repeating(
-            bot.auth_watchdog, interval=15 * 60, first=60, name='auth_watchdog')
-        logger.info(f"🚀 Планировщик запущен: проверка каждые {interval_min} мин, "
-                    f"watchdog сессии каждые 15 мин")
 
-    application.create_task(_init())
-
-
-def post_shutdown(application: Application) -> None:
+async def _post_shutdown(application: Application) -> None:
     bot = application.bot_data['bot']
-
-    async def _shutdown():
+    try:
         await bot.steam.close()
-        logger.info("👋 Бот остановлен, ресурсы освобождены")
-
-    application.create_task(_shutdown())
+    except Exception as e:
+        logger.warning(f"Не удалось корректно закрыть сессию Steam: {e}")
+    logger.info("👋 Бот остановлен, ресурсы освобождены")
 
 
 def main():
@@ -1597,8 +1615,8 @@ def main():
     application.bot_data['bot'] = bot
     bot.app = application
 
-    application.post_init = post_init
-    application.post_shutdown = post_shutdown
+    application.post_init = _post_init
+    application.post_shutdown = _post_shutdown
 
     logger.info(f"🚀 Запуск Steam Free Games Bot v2 (admin={BOT_CONFIG['admin_id']})")
     try:
@@ -1609,8 +1627,26 @@ def main():
         )
     except KeyboardInterrupt:
         logger.info("👋 Остановлено пользователем")
+    except InvalidToken as e:
+        t = BOT_CONFIG['token'] or ''
+        msg = str(e).lower()
+        reasons = []
+        if not re.fullmatch(r'\d{6,10}:[A-Za-z0-9_-]{34,}', t):
+            reasons.append('Токен имеет НЕВЕРНЫЙ ФОРМАТ. Ожидается "123456789:AA...". '
+                           'Проверьте строку TELEGRAM_BOT_TOKEN в .env: значение без кавычек, '
+                           'без пробелов и без повтора "TELEGRAM_BOT_TOKEN=" внутри значения.')
+        if 'not found' in msg or 'unauthorized' in msg:
+            reasons.append('Формат токена корректный, но Telegram его не находит. Возможные причины: '
+                           'токен отозван/пересоздан в @BotFather (нужно вставить НОВЫЙ), '
+                           'или перепутаны символы при копировании (проверьте, что скопирована вся строка).')
+        detail = '\n'.join('   • ' + r for r in reasons) or f'   Ответ сервера: {e}'
+        logger.critical(
+            f"💥 Telegram отклонил токен бота.{detail}\n"
+            "   Новый токен: @BotFather -> /mybots -> ваш бот -> API Token. Затем обновите .env."
+        )
+        sys.exit(2)
     except Exception as e:
-        logger.critical(f"💥 Критическая ошибка: {e}")
+        logger.critical(f"💥 Критическая ошибка: {e}", exc_info=True)
         sys.exit(1)
 
 
